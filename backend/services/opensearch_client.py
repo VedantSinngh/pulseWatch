@@ -11,8 +11,14 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from opensearchpy import AsyncOpenSearch, ConnectionError as OSConnectionError
-from opensearchpy import NotFoundError, RequestError
+try:
+    from opensearchpy import AsyncOpenSearch, ConnectionError as OSConnectionError, NotFoundError, RequestError
+except ImportError:
+    try:
+        from opensearchpy._async.client import AsyncOpenSearch
+        from opensearchpy.exceptions import ConnectionError as OSConnectionError, NotFoundError, RequestError
+    except ImportError:
+        from opensearchpy import OpenSearch as AsyncOpenSearch, ConnectionError as OSConnectionError, NotFoundError, RequestError  # type: ignore
 
 log = logging.getLogger("backend.opensearch")
 
@@ -27,10 +33,10 @@ class DegradedError(RuntimeError):
 
 
 # Singleton client — created once on app startup
-_client: Optional[AsyncOpenSearch] = None
+_client: Optional[Any] = None
 
 
-def get_client() -> AsyncOpenSearch:
+def get_client() -> Any:
     global _client
     if _client is None:
         _client = AsyncOpenSearch(
@@ -48,7 +54,10 @@ def get_client() -> AsyncOpenSearch:
 async def close_client() -> None:
     global _client
     if _client is not None:
-        await _client.close()
+        if hasattr(_client, "close"):
+            res = _client.close()
+            if hasattr(res, "__await__"):
+                await res
         _client = None
 
 
@@ -57,7 +66,8 @@ async def check_health() -> Dict[str, Any]:
     t0 = time.monotonic()
     try:
         client = get_client()
-        resp = await client.cluster.health()
+        res = client.cluster.health()
+        resp = await res if hasattr(res, "__await__") else res
         latency = (time.monotonic() - t0) * 1000
         return {"status": "ok", "latency_ms": round(latency, 1), "cluster": resp}
     except Exception as exc:
@@ -70,7 +80,8 @@ async def search(index: str, body: Dict, size: int = 100) -> Dict:
     """Execute a search query; raises DegradedError on connectivity failure."""
     try:
         client = get_client()
-        resp = await client.search(index=index, body=body, size=size)
+        res = client.search(index=index, body=body, size=size)
+        resp = await res if hasattr(res, "__await__") else res
         return resp
     except OSConnectionError as exc:
         log.error("OpenSearch connection error on search [%s]: %s", index, exc)
@@ -87,7 +98,8 @@ async def count(index: str, body: Optional[Dict] = None) -> int:
     """Count documents in an index."""
     try:
         client = get_client()
-        resp = await client.count(index=index, body=body or {"query": {"match_all": {}}})
+        res = client.count(index=index, body=body or {"query": {"match_all": {}}})
+        resp = await res if hasattr(res, "__await__") else res
         return int(resp.get("count", 0))
     except OSConnectionError as exc:
         log.warning("OpenSearch count failed: %s", exc)
