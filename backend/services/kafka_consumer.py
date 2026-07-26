@@ -16,8 +16,6 @@ import time
 from typing import Set
 
 from fastapi import WebSocket
-from aiokafka import AIOKafkaConsumer
-from aiokafka.errors import KafkaConnectionError
 
 log = logging.getLogger("backend.kafka_consumer")
 
@@ -57,9 +55,17 @@ async def _consume_loop() -> None:
     """
     Continuously consume from anomaly-alerts Kafka topic and broadcast
     each message to all connected WebSocket clients.
-    Retries indefinitely on connection failure with backoff.
+    Degrades gracefully if Kafka is not running.
     """
-    backoff = 2.0
+    if KAFKA_BROKER.lower() in ("disabled", "none", "false", ""):
+        log.info("Kafka broker disabled via environment. Running without live streaming.")
+        return
+
+    from aiokafka import AIOKafkaConsumer
+
+    failed_attempts = 0
+    max_retries = 3
+
     while True:
         consumer: AIOKafkaConsumer | None = None
         try:
@@ -70,21 +76,20 @@ async def _consume_loop() -> None:
                 auto_offset_reset="latest",
                 enable_auto_commit=True,
                 value_deserializer=lambda v: v.decode("utf-8"),
-                # Reasonable session timeout for local dev
                 session_timeout_ms=30000,
                 heartbeat_interval_ms=3000,
+                request_timeout_ms=5000,
             )
             await consumer.start()
             log.info("Kafka consumer started. Subscribed to: %s", TOPIC_ANOMALIES)
-            backoff = 2.0  # reset backoff on successful connect
+            failed_attempts = 0
 
             async for msg in consumer:
                 try:
                     payload = json.loads(msg.value)
                     await broadcast(json.dumps(payload))
-                    log.debug("Broadcast anomaly: sensor=%s", payload.get("sensor_id"))
-                except json.JSONDecodeError as exc:
-                    log.warning("Invalid JSON from Kafka: %s", exc)
+                except json.JSONDecodeError:
+                    pass
                 except Exception as exc:
                     log.warning("Error processing Kafka message: %s", exc)
 
@@ -92,9 +97,12 @@ async def _consume_loop() -> None:
             log.info("Kafka consumer task cancelled.")
             break
         except Exception as exc:
-            log.warning("Kafka consumer error: %s. Retrying in %.0fs...", exc, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)  # exponential backoff, cap at 60s
+            failed_attempts += 1
+            if failed_attempts >= max_retries:
+                log.info("Kafka broker [%s] unreachable (%s). Entering degraded mode (polling fallback active).", KAFKA_BROKER, exc)
+                break
+            log.warning("Kafka consumer connection attempt %d failed. Retrying in 5s...", failed_attempts)
+            await asyncio.sleep(5)
         finally:
             if consumer is not None:
                 try:
@@ -107,7 +115,6 @@ async def start_consumer() -> None:
     """Launch the consumer loop as a background asyncio task."""
     global _consumer_task
     _consumer_task = asyncio.create_task(_consume_loop(), name="kafka-anomaly-consumer")
-    log.info("Kafka anomaly consumer task started.")
 
 
 async def stop_consumer() -> None:
@@ -119,18 +126,20 @@ async def stop_consumer() -> None:
             await _consumer_task
         except asyncio.CancelledError:
             pass
-    log.info("Kafka anomaly consumer task stopped.")
 
 
 async def check_health() -> dict:
     """Try to reach Kafka and return health dict."""
+    if KAFKA_BROKER.lower() in ("disabled", "none", "false", ""):
+        return {"status": "down", "message": "Kafka disabled"}
     t0 = time.monotonic()
     try:
+        from aiokafka import AIOKafkaConsumer
         probe = AIOKafkaConsumer(
             bootstrap_servers=KAFKA_BROKER,
             request_timeout_ms=3000,
         )
-        await asyncio.wait_for(probe.start(), timeout=4.0)
+        await asyncio.wait_for(probe.start(), timeout=3.0)
         await probe.stop()
         latency = (time.monotonic() - t0) * 1000
         return {"status": "ok", "latency_ms": round(latency, 1)}
