@@ -136,8 +136,6 @@ export default function TimeSeriesChart({ entityId, liveEvents }: TimeSeriesChar
     );
   }
 
-  const anomalyPoints = data.filter((d) => d.anomaly !== null);
-
   return (
     <div>
       <div className="flex items-center gap-4 mb-4 text-xs text-zinc-500">
@@ -224,8 +222,8 @@ export default function TimeSeriesChart({ entityId, liveEvents }: TimeSeriesChar
             dataKey="anomaly"
             fill="#ef4444"
             name="Anomaly"
-            shape={(props: Record<string, unknown>) => {
-              const { cx, cy } = props as { cx: number; cy: number };
+            shape={(props: any) => {
+              const { cx, cy } = props || {};
               if (cy == null) return <g />;
               return (
                 <circle
