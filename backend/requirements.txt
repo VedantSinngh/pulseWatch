@@ -1,0 +1,7 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+opensearch-py[async]==2.5.0
+aiokafka==0.10.0
+pydantic==2.7.1
+pydantic-settings==2.2.1
+python-json-logger==2.0.7

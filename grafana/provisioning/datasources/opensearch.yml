@@ -1,0 +1,19 @@
+apiVersion: 1
+
+datasources:
+  - name: OpenSearch
+    type: grafana-opensearch-datasource
+    uid: pulsewatch-opensearch
+    access: proxy
+    url: http://opensearch:9200
+    jsonData:
+      database: events-raw
+      flavor: opensearch
+      version: 2.13.0
+      timeField: timestamp
+      logLevelField: severity
+      logMessageField: sensor_id
+      maxConcurrentShardRequests: 5
+      pplEnabled: true
+    isDefault: true
+    editable: true

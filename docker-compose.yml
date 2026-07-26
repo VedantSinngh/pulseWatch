@@ -1,0 +1,300 @@
+# ============================================================
+# PulseWatch — Docker Compose
+# Full stack: Zookeeper → Kafka → Generator → Spark →
+#             OpenSearch → Grafana → FastAPI → Next.js
+# ============================================================
+
+version: "3.9"
+
+# ── Shared network ───────────────────────────────────────────
+networks:
+  pulsewatch:
+    driver: bridge
+
+# ── Named volumes ────────────────────────────────────────────
+volumes:
+  zookeeper_data:
+  kafka_data:
+  opensearch_data:
+  grafana_data:
+
+# ── Services ─────────────────────────────────────────────────
+services:
+
+  # ── 1. Zookeeper ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: pulsewatch-zookeeper
+    restart: unless-stopped
+    networks: [pulsewatch]
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ── 2. Kafka ─────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: pulsewatch-kafka
+    restart: unless-stopped
+    networks: [pulsewatch]
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Listeners: internal (container-to-container) + external (host)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168          # 7 days
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: ${KAFKA_PARTITIONS:-3}
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 40s
+
+  # ── 3. Kafka topic initializer (one-shot) ────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: pulsewatch-kafka-init
+    networks: [pulsewatch]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Creating Kafka topics..."
+        kafka-topics --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic ${KAFKA_TOPIC_RAW:-raw-events} \
+          --partitions ${KAFKA_PARTITIONS:-3} \
+          --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic ${KAFKA_TOPIC_ANOMALIES:-anomaly-alerts} \
+          --partitions 1 \
+          --replication-factor 1
+        echo "Topics created."
+
+  # ── 4. OpenSearch ─────────────────────────────────────────
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: pulsewatch-opensearch
+    restart: unless-stopped
+    networks: [pulsewatch]
+    ports:
+      - "${OPENSEARCH_PORT:-9200}:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    environment:
+      cluster.name: pulsewatch-cluster
+      node.name: pulsewatch-node1
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      # Disable security plugin for local dev (no TLS, no auth)
+      plugins.security.disabled: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # ── 5. OpenSearch ILM / index template initializer ───────
+  opensearch-init:
+    image: curlimages/curl:8.7.1
+    container_name: pulsewatch-opensearch-init
+    networks: [pulsewatch]
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    volumes:
+      - ./opensearch/init:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/init.sh"]
+
+  # ── 6. Data Generator ────────────────────────────────────
+  data-generator:
+    build:
+      context: ./data-generator
+      dockerfile: Dockerfile
+    container_name: pulsewatch-generator
+    restart: unless-stopped
+    networks: [pulsewatch]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+      KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW:-raw-events}
+      KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-3}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "python /app/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── 7. PySpark Streaming Job ─────────────────────────────
+  spark-job:
+    build:
+      context: ./spark-job
+      dockerfile: Dockerfile
+    container_name: pulsewatch-spark
+    restart: unless-stopped
+    networks: [pulsewatch]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      opensearch-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+      KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW:-raw-events}
+      KAFKA_TOPIC_ANOMALIES: ${KAFKA_TOPIC_ANOMALIES:-anomaly-alerts}
+      OPENSEARCH_HOST: ${OPENSEARCH_HOST:-opensearch}
+      OPENSEARCH_PORT: ${OPENSEARCH_PORT:-9200}
+      OPENSEARCH_SCHEME: ${OPENSEARCH_SCHEME:-http}
+      OPENSEARCH_INDEX_RAW: ${OPENSEARCH_INDEX_RAW:-events-raw}
+      OPENSEARCH_INDEX_ANOMALIES: ${OPENSEARCH_INDEX_ANOMALIES:-events-anomalies}
+      SPARK_MASTER: ${SPARK_MASTER:-local[2]}
+      SPARK_EXECUTOR_MEMORY: ${SPARK_EXECUTOR_MEMORY:-1g}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+      IF_RETRAIN_INTERVAL_MIN: ${IF_RETRAIN_INTERVAL_MIN:-5}
+      WINDOW_DURATION: ${WINDOW_DURATION:-5 minutes}
+      SLIDE_DURATION: ${SLIDE_DURATION:-1 minute}
+      ZSCORE_THRESHOLD: ${ZSCORE_THRESHOLD:-3.0}
+      CUSUM_SLACK: ${CUSUM_SLACK:-1.0}
+      CUSUM_THRESHOLD: ${CUSUM_THRESHOLD:-5.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # Spark needs more memory; give it ample ulimits
+    mem_limit: 3g
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep streaming_job | grep -v grep"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── 8. Grafana ───────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:10.4.2
+    container_name: pulsewatch-grafana
+    restart: unless-stopped
+    networks: [pulsewatch]
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: grafana-opensearch-datasource
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── 9. FastAPI Backend ───────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pulsewatch-backend
+    restart: unless-stopped
+    networks: [pulsewatch]
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+      KAFKA_TOPIC_ANOMALIES: ${KAFKA_TOPIC_ANOMALIES:-anomaly-alerts}
+      OPENSEARCH_HOST: ${OPENSEARCH_HOST:-opensearch}
+      OPENSEARCH_PORT: ${OPENSEARCH_PORT:-9200}
+      OPENSEARCH_SCHEME: ${OPENSEARCH_SCHEME:-http}
+      OPENSEARCH_INDEX_RAW: ${OPENSEARCH_INDEX_RAW:-events-raw}
+      OPENSEARCH_INDEX_ANOMALIES: ${OPENSEARCH_INDEX_ANOMALIES:-events-anomalies}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── 10. Next.js Frontend ─────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pulsewatch-frontend
+    restart: unless-stopped
+    networks: [pulsewatch]
+    ports:
+      - "${FRONTEND_PORT:-3001}:3001"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8000}
+      PORT: 3001
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3001"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
